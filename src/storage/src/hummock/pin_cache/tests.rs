@@ -73,6 +73,16 @@ pub(super) async fn local_object_store() -> (tempfile::TempDir, ObjectStoreRef) 
     (dir, store)
 }
 
+pub(super) async fn wait_for_reclaim(pin_cache: &PinCache) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pin_cache.gc.accounted_bytes() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 fn start_download(
     pin_cache: &Arc<PinCache>,
     object_id: HummockSstableObjectId,
@@ -89,16 +99,27 @@ fn start_download(
 #[tokio::test]
 #[should_panic(expected = "pin cache shard count must be greater than zero")]
 async fn test_zero_shards_rejected() {
-    PinCache::new(in_memory_object_store(), 0, [])
+    PinCache::new(in_memory_object_store(), 16, 0, [])
         .await
         .unwrap();
+}
+
+#[test]
+fn test_parse_finalized_object_path() {
+    assert_eq!(
+        PinCache::parse_object_id("1001-42.sst"),
+        Some(HummockSstableObjectId::from(1001))
+    );
+    assert_eq!(PinCache::parse_object_id("1001-recovered.sst"), None);
+    assert_eq!(PinCache::parse_object_id("1001-42.tmp"), None);
+    assert_eq!(PinCache::parse_object_id("nested/1001-42.sst"), None);
 }
 
 #[tokio::test]
 async fn test_pin_read_and_unpin_lifecycle() {
     let remote_store = in_memory_object_store();
     let (_dir, local_store) = local_object_store().await;
-    let pin_cache = PinCache::new(local_store, 1, []).await.unwrap();
+    let pin_cache = PinCache::new(local_store, u64::MAX, 1, []).await.unwrap();
     let object_id = HummockSstableObjectId::from(1001);
     let remote_path = "remote.sst";
     let original = Bytes::from_static(b"complete sst");
@@ -158,13 +179,13 @@ async fn test_revoked_token_cannot_begin_a_late_download() {
         .unwrap();
     let object = HummockSstableObjectId::from(911);
     for revoke_by_unpin in [false, true] {
-        let cache = PinCache::new(in_memory_object_store(), 1, [])
+        let cache = PinCache::new(in_memory_object_store(), u64::MAX, 1, [])
             .await
             .unwrap();
         cache.update_policy([(object, 8)]);
         let token = cache.prepare_refill(object).unwrap();
         assert_eq!(token.object_id(), object);
-
+        assert_eq!(cache.gc.accounted_bytes(), 0);
         if revoke_by_unpin {
             cache.update_policy([]);
             cache.update_policy([(object, 8)]);
@@ -192,7 +213,7 @@ async fn test_revoked_token_cannot_begin_a_late_download() {
 #[tokio::test]
 async fn test_revoke_retired_withdraws_previous_version_route() {
     let remote_store = in_memory_object_store();
-    let cache = PinCache::new(in_memory_object_store(), 1, [])
+    let cache = PinCache::new(in_memory_object_store(), u64::MAX, 1, [])
         .await
         .unwrap();
     let object = HummockSstableObjectId::from(911);
@@ -215,7 +236,7 @@ async fn test_revoke_retired_withdraws_previous_version_route() {
 #[tokio::test]
 async fn test_same_delta_replacement_keeps_route() {
     let remote_store = in_memory_object_store();
-    let pin_cache = PinCache::new(in_memory_object_store(), 1, [])
+    let pin_cache = PinCache::new(in_memory_object_store(), u64::MAX, 1, [])
         .await
         .unwrap();
     let object_id = HummockSstableObjectId::from(1001);
@@ -240,7 +261,7 @@ async fn test_same_delta_replacement_keeps_route() {
 
 #[tokio::test]
 async fn test_inflight_is_not_routable_and_cancellation_releases_token() {
-    let pin_cache = PinCache::new(in_memory_object_store(), 1, [])
+    let pin_cache = PinCache::new(in_memory_object_store(), u64::MAX, 1, [])
         .await
         .unwrap();
     let object_id = HummockSstableObjectId::from(1001);
@@ -280,7 +301,7 @@ async fn test_inflight_is_not_routable_and_cancellation_releases_token() {
 #[tokio::test]
 async fn test_revoked_download_cannot_publish_or_remove_replacement() {
     for revoke_by_unpin in [false, true] {
-        let pin_cache = PinCache::new(in_memory_object_store(), 1, [])
+        let pin_cache = PinCache::new(in_memory_object_store(), u64::MAX, 1, [])
             .await
             .unwrap();
         let object_id = HummockSstableObjectId::from(1001);
@@ -328,7 +349,7 @@ async fn test_revoked_download_cannot_publish_or_remove_replacement() {
 #[tokio::test]
 async fn test_failed_download_can_be_retried() {
     let remote_store = in_memory_object_store();
-    let pin_cache = PinCache::new(in_memory_object_store(), 1, [])
+    let pin_cache = PinCache::new(in_memory_object_store(), 8, 1, [])
         .await
         .unwrap();
     let object_id = HummockSstableObjectId::from(1001);
@@ -341,6 +362,7 @@ async fn test_failed_download_can_be_retried() {
             .is_err()
     );
     assert!(pin_cache.get(object_id).is_none());
+    wait_for_reclaim(&pin_cache).await;
 
     remote_store
         .upload("sst", Bytes::from_static(b"complete"))
@@ -357,10 +379,10 @@ async fn test_failed_download_can_be_retried() {
 }
 
 #[tokio::test]
-async fn test_interrupted_fs_upload_cannot_publish() {
+async fn test_interrupted_fs_upload_keeps_capacity_until_recovery() {
     for cancel in [false, true] {
         let (_dir, local_store) = local_object_store().await;
-        let pin_cache = PinCache::new(local_store.clone(), 1, []).await.unwrap();
+        let pin_cache = PinCache::new(local_store.clone(), 8, 1, []).await.unwrap();
         let object_id = HummockSstableObjectId::from(1001);
         pin_cache.update_policy([(object_id, 8)]);
 
@@ -417,8 +439,6 @@ async fn test_interrupted_fs_upload_cannot_publish() {
         }
 
         assert!(pin_cache.get(object_id).is_none());
-        // Cancellation/failure returns the object to Missing, so a retry can start.
-        drop(start_download(&pin_cache, object_id));
         assert!(
             local_store
                 .metadata(&final_path)
@@ -426,13 +446,51 @@ async fn test_interrupted_fs_upload_cannot_publish() {
                 .unwrap_err()
                 .is_object_not_found_error()
         );
+        assert_eq!(pin_cache.gc.accounted_bytes(), 8);
+        // The download slot is released, but unfinished temporary bytes still consume capacity.
+        assert_eq!(
+            pin_cache
+                .pin_sst(in_memory_object_store(), "unused".into(), object_id)
+                .await
+                .unwrap(),
+            PinCacheRefillOutcome::CapacityRejected
+        );
+        // Unpin must not release the reservation for the backend-owned temporary file either.
+        pin_cache.update_policy([]);
+        assert_eq!(pin_cache.gc.accounted_bytes(), 8);
+        drop(pin_cache);
+
+        let recovered = PinCache::new(local_store.clone(), 8, 1, [(object_id, 8)])
+            .await
+            .unwrap();
+
+        wait_for_reclaim(&recovered).await;
+        assert!(recovered.get(object_id).is_none());
+        let files: Vec<_> = local_store
+            .list("", None, None)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(files.iter().all(|file| file.key.ends_with('/')));
+        let remote_store = in_memory_object_store();
+        remote_store
+            .upload("sst", Bytes::from_static(b"complete"))
+            .await
+            .unwrap();
+        recovered
+            .pin_sst(remote_store, "sst".into(), object_id)
+            .await
+            .unwrap();
+        assert!(recovered.get(object_id).is_some());
     }
 }
 
 #[tokio::test]
-async fn test_completed_invalid_fs_upload_cannot_publish() {
+async fn test_completed_invalid_fs_upload_reclaims_capacity() {
     let (_dir, local_store) = local_object_store().await;
-    let pin_cache = PinCache::new(local_store.clone(), 1, []).await.unwrap();
+    let pin_cache = PinCache::new(local_store.clone(), 8, 1, []).await.unwrap();
     let remote_store = in_memory_object_store();
     remote_store
         .upload("sst", Bytes::from_static(b"half"))
@@ -447,12 +505,53 @@ async fn test_completed_invalid_fs_upload_cannot_publish() {
             .is_err()
     );
     assert!(pin_cache.get(object_id).is_none());
+    wait_for_reclaim(&pin_cache).await;
+    let files: Vec<_> = local_store
+        .list("", None, None)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(files.iter().all(|file| file.key.ends_with('/')));
+}
+
+#[tokio::test]
+async fn test_recovery_rejects_incomplete_inventory() {
+    for partial_inventory in [false, true] {
+        let local_store = in_memory_object_store();
+        let mut cache = PinCache::new(local_store.clone(), 16, 1, []).await.unwrap();
+        local_store
+            .upload("1001-42.sst", Bytes::from_static(b"complete"))
+            .await
+            .unwrap();
+        let error = ObjectError::internal("injected inventory failure");
+        let objects = if partial_inventory {
+            let metadata = local_store.metadata("1001-42.sst").await.unwrap();
+            Ok(stream::iter([Ok(metadata), Err(error)]).boxed())
+        } else {
+            Err(error)
+        };
+        // Exercise both list and mid-stream failures before sharing the cache.
+        let result = Arc::get_mut(&mut cache)
+            .unwrap()
+            .recover_local_files(objects)
+            .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("injected inventory failure")
+        );
+        assert!(cache.get(1001.into()).is_none());
+        assert!(local_store.metadata("1001-42.sst").await.is_ok());
+    }
 }
 
 #[tokio::test]
 async fn test_read_failure_only_invalidates_selected_publication() {
     let remote_store = in_memory_object_store();
-    let pin_cache = PinCache::new(in_memory_object_store(), 1, [])
+    let pin_cache = PinCache::new(in_memory_object_store(), u64::MAX, 1, [])
         .await
         .unwrap();
     let object_id = HummockSstableObjectId::from(1001);
@@ -482,6 +581,30 @@ async fn test_read_failure_only_invalidates_selected_publication() {
     );
 }
 
+#[tokio::test]
+async fn test_recovery_reclaims_files_outside_initial_membership() {
+    let local_store = in_memory_object_store();
+    for path in ["1001-42.sst", "unfinished.tmp"] {
+        local_store
+            .upload(path, Bytes::from_static(b"stale"))
+            .await
+            .unwrap();
+    }
+    let pin_cache = PinCache::new(local_store.clone(), 1024, 1, [])
+        .await
+        .unwrap();
+    wait_for_reclaim(&pin_cache).await;
+    for path in ["1001-42.sst", "unfinished.tmp"] {
+        assert!(
+            local_store
+                .metadata(path)
+                .await
+                .unwrap_err()
+                .is_object_not_found_error()
+        );
+    }
+}
+
 fn object_in_shard(shard: usize, shard_num: usize) -> HummockSstableObjectId {
     (1..)
         .map(HummockSstableObjectId::from)
@@ -496,7 +619,7 @@ async fn test_other_shard_and_control_locks_do_not_block_lookup_or_publish() {
     let system_params = system_params_for_test().into();
     let memory = extract_storage_memory_config(&config);
     let opts = StorageOpts::from((&config, &system_params, &memory));
-    let cache = PinCache::new(in_memory_object_store(), opts.pin_cache_shard_num, [])
+    let cache = PinCache::new(in_memory_object_store(), 16, opts.pin_cache_shard_num, [])
         .await
         .unwrap();
     assert_eq!(cache.shards.len(), 3);
@@ -537,11 +660,12 @@ async fn test_other_shard_and_control_locks_do_not_block_lookup_or_publish() {
         result
     });
     result.expect("an unrelated shard or control lock blocked the object lifecycle");
+    wait_for_reclaim(&cache).await;
 }
 
 #[tokio::test]
 async fn test_version_handoff_across_shards() {
-    let cache = PinCache::new(in_memory_object_store(), 3, [])
+    let cache = PinCache::new(in_memory_object_store(), 64, 3, [])
         .await
         .unwrap();
 
@@ -588,49 +712,7 @@ async fn test_version_handoff_across_shards() {
 
     cache.update_policy([]);
     assert!(objects.iter().all(|&id| cache.get(id).is_none()));
-}
-
-#[test]
-fn test_parse_finalized_object_path() {
-    assert_eq!(
-        PinCache::parse_object_id("1001-42.sst"),
-        Some(HummockSstableObjectId::from(1001))
-    );
-    assert_eq!(PinCache::parse_object_id("1001-recovered.sst"), None);
-    assert_eq!(PinCache::parse_object_id("1001-42.tmp"), None);
-    assert_eq!(PinCache::parse_object_id("nested/1001-42.sst"), None);
-}
-
-#[tokio::test]
-async fn test_recovery_rejects_incomplete_inventory() {
-    for partial_inventory in [false, true] {
-        let local_store = in_memory_object_store();
-        let mut cache = PinCache::new(local_store.clone(), 1, []).await.unwrap();
-        local_store
-            .upload("1001-42.sst", Bytes::from_static(b"complete"))
-            .await
-            .unwrap();
-        let error = ObjectError::internal("injected inventory failure");
-        let objects = if partial_inventory {
-            let metadata = local_store.metadata("1001-42.sst").await.unwrap();
-            Ok(stream::iter([Ok(metadata), Err(error)]).boxed())
-        } else {
-            Err(error)
-        };
-        // Exercise both list and mid-stream failures before sharing the cache.
-        let result = Arc::get_mut(&mut cache)
-            .unwrap()
-            .recover_local_files(objects)
-            .await;
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("injected inventory failure")
-        );
-        assert!(cache.get(1001.into()).is_none());
-        assert!(local_store.metadata("1001-42.sst").await.is_ok());
-    }
+    wait_for_reclaim(&cache).await;
 }
 
 #[tokio::test]
@@ -655,7 +737,7 @@ async fn test_recovery_returns_ready_routes_across_shards() {
             .await
             .unwrap();
     }
-    let cache = PinCache::new(local.clone(), 3, objects.into_iter().map(|id| (id, 8)))
+    let cache = PinCache::new(local.clone(), 32, 3, objects.into_iter().map(|id| (id, 8)))
         .await
         .unwrap();
 
@@ -666,4 +748,14 @@ async fn test_recovery_returns_ready_routes_across_shards() {
             Bytes::from_static(b"complete")
         );
     }
+    // Duplicate recovered paths are reclaimed, with exactly one publication per object.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while cache.gc.accounted_bytes() != 16 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    cache.update_policy([]);
+    wait_for_reclaim(&cache).await;
 }

@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_hummock_sdk::{HummockSstableObjectId, HummockVersionId};
 
-use super::{PinCache, PinCacheState};
+use super::{PinCache, PinCacheEntry, PinCacheState};
 
 impl PinCacheState {
     fn apply_desired_object_delta(
@@ -37,9 +38,13 @@ impl PinCacheState {
         }
     }
 
-    fn replace_desired_objects(&mut self, desired: HashMap<HummockSstableObjectId, u64>) {
+    fn replace_desired_objects(
+        &mut self,
+        desired: HashMap<HummockSstableObjectId, u64>,
+        stale: &mut Vec<Arc<PinCacheEntry>>,
+    ) {
         // A policy replacement ends previous-version retention too.
-        self.remove_objects_if(|id, object| desired.get(&id) != Some(&object.size()));
+        self.remove_objects_if(|id, object| desired.get(&id) != Some(&object.size()), stale);
         for (id, size) in desired {
             self.insert_desired(id, size);
         }
@@ -48,7 +53,7 @@ impl PinCacheState {
 
 impl PinCache {
     /// Completes a version handoff after readers can use `applied`.
-    /// Withdraws objects retained only for earlier versions, removing their local read routes.
+    /// Withdraws objects retained only for earlier versions, then schedules file reclamation.
     pub(crate) fn on_version_applied(&self, applied: HummockVersionId) {
         self.revoke_retired_through(applied);
     }
@@ -60,21 +65,25 @@ impl PinCache {
     }
 
     fn revoke_retired_through(&self, applied: HummockVersionId) {
-        let _update = self.membership_update.lock();
-        for shard in &self.shards {
-            let mut state = shard.write();
-            while let Some(&(version, id)) = state.retirements.first() {
-                if version > applied {
-                    break;
+        let mut stale = Vec::new();
+        {
+            let _update = self.membership_update.lock();
+            for shard in &self.shards {
+                let mut state = shard.write();
+                while let Some(&(version, id)) = state.retirements.first() {
+                    if version > applied {
+                        break;
+                    }
+                    state.retirements.pop_first();
+                    let mut object = state
+                        .objects
+                        .remove(&id)
+                        .expect("retirement belongs to an object");
+                    stale.extend(object.take_published());
                 }
-                state.retirements.pop_first();
-                let mut object = state
-                    .objects
-                    .remove(&id)
-                    .expect("retirement belongs to an object");
-                object.take_published();
             }
         }
+        self.gc.reclaim(stale);
     }
 
     fn partition_objects(
@@ -100,10 +109,14 @@ impl PinCache {
         objects: impl IntoIterator<Item = (HummockSstableObjectId, u64)>,
     ) {
         let desired = self.partition_objects(objects);
-        let _update = self.membership_update.lock();
-        for (shard, desired) in self.shards.iter().zip_eq_fast(desired) {
-            shard.write().replace_desired_objects(desired);
+        let mut stale = Vec::new();
+        {
+            let _update = self.membership_update.lock();
+            for (shard, desired) in self.shards.iter().zip_eq_fast(desired) {
+                shard.write().replace_desired_objects(desired, &mut stale);
+            }
         }
+        self.gc.reclaim(stale);
     }
 
     /// Installs a version snapshot, retaining removed objects until `on_version_applied(version)`.

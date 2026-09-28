@@ -22,7 +22,7 @@
 //! revocation also changes its admission identity. Removing the object invalidates all tokens.
 //! A version handoff only sets a retirement deadline; it does not change the file stage.
 //! Reads use `get` and never create refill work. Recovery completes before sharing the cache.
-//! Capacity accounting and physical reclamation are added before production activation.
+//! File capacity and reclamation belong to the private GC worker, including obsolete downloads.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -33,12 +33,14 @@ use parking_lot::{Mutex, RwLock};
 use risingwave_hummock_sdk::{HummockSstableObjectId, HummockVersionId};
 use risingwave_object_store::object::{ObjectRangeBounds, ObjectResult, ObjectStoreRef};
 
+mod gc;
 mod membership;
 mod recovery;
 mod refill;
 #[cfg(test)]
 mod tests;
 
+use self::gc::PinCacheGc;
 use crate::monitor::GLOBAL_PIN_CACHE_METRICS;
 
 fn metric_bytes(bytes: u64) -> i64 {
@@ -166,12 +168,13 @@ impl PinCacheState {
     fn remove_objects_if(
         &mut self,
         mut remove: impl FnMut(HummockSstableObjectId, &PinCacheObject) -> bool,
+        stale: &mut Vec<Arc<PinCacheEntry>>,
     ) {
         for (id, mut object) in self.objects.extract_if(|id, object| remove(*id, object)) {
             if let Some(version) = object.retire_at {
                 self.retirements.remove(&(version, id));
             }
-            object.take_published();
+            stale.extend(object.take_published());
         }
     }
 }
@@ -182,11 +185,12 @@ pub(crate) struct PinCache {
     shards: Box<[RwLock<PinCacheState>]>,
     // Serializes batch membership updates, never acquired by foreground lookups.
     // A batch becomes visible shard by shard; each object's transition remains atomic.
-    // Nested state locks follow membership_update -> one shard. Never hold
-    // two shard locks together. Construction finishes before this cache is shared.
-    // Shard code must not call back into membership or the refill executor, or perform I/O
+    // Nested state locks follow membership_update -> one shard -> GC accounting. Never hold
+    // two shard locks together. Startup recovery finishes before this cache is shared.
+    // Shard/GC code must not call back into membership or the refill executor, or perform I/O
     // while locked. The executor may hold its own state lock while calling shard operations.
     membership_update: Mutex<()>,
+    gc: PinCacheGc,
     next_path_id: AtomicU64,
 }
 
@@ -215,12 +219,14 @@ pub(crate) enum PinCacheRefillOutcome {
     AlreadyPublished,
     /// Another download for this object is still in flight; this attempt skipped the download.
     InProgress,
+    /// This attempt could not reserve enough local capacity to start downloading.
+    CapacityRejected,
     /// This attempt is no longer eligible to publish, for example after its generation is revoked.
     Obsolete,
 }
 
 /// A snapshot of a published route. Reads never look up the object a second time.
-/// Callers must support fallback if the selected local file becomes unavailable.
+/// Holding this handle does not prevent GC from deleting the file; callers must support fallback.
 #[derive(Clone)]
 pub(crate) struct PinCacheReadHandle {
     pin_cache: Arc<PinCache>,
@@ -233,15 +239,21 @@ impl PinCacheReadHandle {
     /// Call this only for data actually read through this handle: a shared cache fetch may fail
     /// on another request's route without ever reading this file.
     pub(crate) fn invalidate(&self) {
-        let mut state = self.pin_cache.shard(self.object_id).write();
-        // A late failure must not invalidate a newer publication of the same object.
-        if let Some(object) = state.objects.get_mut(&self.object_id)
-            && object
+        let entry = {
+            let mut state = self.pin_cache.shard(self.object_id).write();
+            let Some(object) = state.objects.get_mut(&self.object_id) else {
+                return;
+            };
+            // A late failure must not invalidate a newer publication of the same object.
+            if !object
                 .published()
                 .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
-        {
-            object.take_published();
-        }
+            {
+                return;
+            }
+            object.take_published()
+        };
+        self.pin_cache.gc.reclaim(entry);
     }
 
     /// Reads the selected publication through the local object store. On failure, invalidates only
@@ -260,6 +272,7 @@ impl PinCache {
     /// An incomplete inventory fails initialization; no partially recovered cache is returned.
     pub(crate) async fn new(
         store: ObjectStoreRef,
+        capacity: u64,
         shard_num: usize,
         desired: impl IntoIterator<Item = (HummockSstableObjectId, u64)>,
     ) -> ObjectResult<Arc<Self>> {
@@ -267,8 +280,10 @@ impl PinCache {
             shard_num > 0,
             "pin cache shard count must be greater than zero"
         );
+        let gc = PinCacheGc::new(Arc::clone(&store), capacity);
         let mut pin_cache = Self {
             store,
+            gc,
             shards: (0..shard_num)
                 .map(|_| RwLock::new(PinCacheState::default()))
                 .collect(),

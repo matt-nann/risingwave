@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, LazyLock};
 
+use risingwave_common::log::LogSuppressor;
 use risingwave_hummock_sdk::HummockSstableObjectId;
 use risingwave_object_store::object::{
     MonitoredStreamingReader, ObjectError, ObjectResult, ObjectStoreRef,
@@ -38,6 +39,8 @@ pub(super) struct PinCacheDownloadGuard {
     token: PinCacheRefillToken,
     // Publication moves the entry into the read index. Drop releases an unpublished attempt.
     pub(super) entry: Option<Arc<PinCacheEntry>>,
+    // An unfinished uploader may leave backend-owned temporary files with unknown paths.
+    upload_in_progress: bool,
 }
 
 impl PinCacheDownloadGuard {
@@ -51,16 +54,18 @@ impl PinCacheDownloadGuard {
     /// Copies an existing SST stream into a unique local path using the object-store uploader.
     /// After finishing the upload, checks both the copied byte count and local file size before
     /// attempting publication. Publication still requires the current download token and membership.
-    /// On error or cancellation, `Drop` releases the in-flight token without publishing a route.
-    /// Physical file reclamation is added separately.
+    /// On error or cancellation, Drop releases this download and reclaims its file. An unfinished
+    /// uploader keeps its capacity reservation until recovery can inventory temporary files.
     pub(super) async fn write(
-        self,
+        mut self,
         mut reader: MonitoredStreamingReader,
     ) -> ObjectResult<PinCacheRefillOutcome> {
         let entry = self
             .entry
             .as_ref()
             .expect("download owns an unpublished file");
+        // Cancellation can occur while opening the uploader, before it returns a writer.
+        self.upload_in_progress = true;
         let mut writer = self
             .pin_cache
             .store
@@ -86,6 +91,7 @@ impl PinCacheDownloadGuard {
             .finish()
             .await
             .inspect_err(|_| self.record_io_failure("local_upload_finish"))?;
+        self.upload_in_progress = false;
         let local_size = self
             .pin_cache
             .store
@@ -122,9 +128,9 @@ impl PinCacheDownloadGuard {
 
 impl Drop for PinCacheDownloadGuard {
     fn drop(&mut self) {
-        if self.entry.is_none() {
+        let Some(entry) = self.entry.take() else {
             return; // Publication transferred ownership to the index.
-        }
+        };
         if let Some(object) = self
             .pin_cache
             .shard(self.token.object_id)
@@ -133,6 +139,20 @@ impl Drop for PinCacheDownloadGuard {
         {
             object.cancel_download();
         }
+
+        if self.upload_in_progress {
+            // Keep the full reservation until startup recovery inventories the actual files.
+            // Do not let final-path deletion release capacity while hidden temporary bytes remain.
+            self.pin_cache.gc.mark_uncertain(&entry);
+            tracing::warn!(
+                object_id = self.token.object_id.as_raw_id(),
+                path = %entry.path,
+                reserved_bytes = entry.size,
+                "unfinished pin cache upload; retaining capacity until recovery"
+            );
+            return;
+        }
+        self.pin_cache.gc.reclaim([entry]);
     }
 }
 
@@ -212,12 +232,29 @@ impl PinCache {
             path: self.new_object_path(object_id),
             size,
         };
+        if let Err(accounted_bytes) = self.gc.try_reserve(&entry) {
+            drop(state);
+            static LOG_SUPPRESSOR: LazyLock<LogSuppressor> =
+                LazyLock::new(|| LogSuppressor::per_minute(1));
+            if let Ok(suppressed_count) = LOG_SUPPRESSOR.check() {
+                tracing::warn!(
+                    suppressed_count,
+                    object_id = object_id.as_raw_id(),
+                    object_size = size,
+                    accounted_bytes,
+                    capacity = self.gc.capacity(),
+                    "skipping pin cache refill because local capacity is exhausted"
+                );
+            }
+            return PinCacheDownloadStart::Complete(PinCacheRefillOutcome::CapacityRejected);
+        }
         let entry = Arc::new(entry);
         object.file = PinCacheFile::Downloading { size };
         PinCacheDownloadStart::Download(PinCacheDownloadGuard {
             pin_cache: Arc::clone(self),
             token,
             entry: Some(entry),
+            upload_in_progress: false,
         })
     }
 
