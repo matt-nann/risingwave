@@ -21,8 +21,8 @@
 //! stage: Missing -> Downloading -> Published. Failure/cancellation returns it to Missing;
 //! revocation also changes its admission identity. Removing the object invalidates all tokens.
 //! A version handoff only sets a retirement deadline; it does not change the file stage.
-//! Reads use `get` and never create refill work. Startup recovery, capacity accounting,
-//! and physical file reclamation are added separately before production activation.
+//! Reads use `get` and never create refill work. Recovery completes before sharing the cache.
+//! Capacity accounting and physical reclamation are added before production activation.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -34,6 +34,7 @@ use risingwave_hummock_sdk::{HummockSstableObjectId, HummockVersionId};
 use risingwave_object_store::object::{ObjectRangeBounds, ObjectResult, ObjectStoreRef};
 
 mod membership;
+mod recovery;
 mod refill;
 #[cfg(test)]
 mod tests;
@@ -255,8 +256,8 @@ impl PinCacheReadHandle {
 }
 
 impl PinCache {
-    /// Creates an index with initial pin-policy/version membership.
-    /// The caller must supply an empty local store; existing-file recovery is added separately.
+    /// Recovers local files selected by the initial pin-policy/version membership before sharing.
+    /// An incomplete inventory fails initialization; no partially recovered cache is returned.
     pub(crate) async fn new(
         store: ObjectStoreRef,
         shard_num: usize,
@@ -280,6 +281,15 @@ impl PinCache {
         }
         GLOBAL_PIN_CACHE_METRICS.published_objects.set(0);
         GLOBAL_PIN_CACHE_METRICS.published_bytes.set(0);
+        GLOBAL_PIN_CACHE_METRICS.recovery_ready.set(0);
+        let objects = pin_cache.store.list("", None, None).await;
+        pin_cache
+            .recover_local_files(objects)
+            .await
+            .inspect_err(|_| {
+                GLOBAL_PIN_CACHE_METRICS.recovery_failures.inc();
+            })?;
+        GLOBAL_PIN_CACHE_METRICS.recovery_ready.set(1);
         Ok(Arc::new(pin_cache))
     }
 

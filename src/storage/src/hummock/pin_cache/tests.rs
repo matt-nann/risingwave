@@ -589,3 +589,81 @@ async fn test_version_handoff_across_shards() {
     cache.update_policy([]);
     assert!(objects.iter().all(|&id| cache.get(id).is_none()));
 }
+
+#[test]
+fn test_parse_finalized_object_path() {
+    assert_eq!(
+        PinCache::parse_object_id("1001-42.sst"),
+        Some(HummockSstableObjectId::from(1001))
+    );
+    assert_eq!(PinCache::parse_object_id("1001-recovered.sst"), None);
+    assert_eq!(PinCache::parse_object_id("1001-42.tmp"), None);
+    assert_eq!(PinCache::parse_object_id("nested/1001-42.sst"), None);
+}
+
+#[tokio::test]
+async fn test_recovery_rejects_incomplete_inventory() {
+    for partial_inventory in [false, true] {
+        let local_store = in_memory_object_store();
+        let mut cache = PinCache::new(local_store.clone(), 1, []).await.unwrap();
+        local_store
+            .upload("1001-42.sst", Bytes::from_static(b"complete"))
+            .await
+            .unwrap();
+        let error = ObjectError::internal("injected inventory failure");
+        let objects = if partial_inventory {
+            let metadata = local_store.metadata("1001-42.sst").await.unwrap();
+            Ok(stream::iter([Ok(metadata), Err(error)]).boxed())
+        } else {
+            Err(error)
+        };
+        // Exercise both list and mid-stream failures before sharing the cache.
+        let result = Arc::get_mut(&mut cache)
+            .unwrap()
+            .recover_local_files(objects)
+            .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("injected inventory failure")
+        );
+        assert!(cache.get(1001.into()).is_none());
+        assert!(local_store.metadata("1001-42.sst").await.is_ok());
+    }
+}
+
+#[tokio::test]
+async fn test_recovery_returns_ready_routes_across_shards() {
+    let (_dir, local) = local_object_store().await;
+    let objects = [object_in_shard(0, 3), object_in_shard(2, 3)];
+    for id in objects {
+        for path_id in [1, 2] {
+            local
+                .upload(
+                    &format!("{}-{path_id}.sst", id.as_raw_id()),
+                    Bytes::from_static(b"complete"),
+                )
+                .await
+                .unwrap();
+        }
+        local
+            .upload(
+                &format!("{}-3.sst", id.as_raw_id()),
+                Bytes::from_static(b"short"),
+            )
+            .await
+            .unwrap();
+    }
+    let cache = PinCache::new(local.clone(), 3, objects.into_iter().map(|id| (id, 8)))
+        .await
+        .unwrap();
+
+    for id in objects {
+        assert!(cache.is_desired(id));
+        assert_eq!(
+            cache.get(id).unwrap().read(..).await.unwrap(),
+            Bytes::from_static(b"complete")
+        );
+    }
+}
